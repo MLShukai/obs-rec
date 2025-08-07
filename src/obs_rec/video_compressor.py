@@ -119,7 +119,10 @@ class VideoCompressor:
         video_bitrate = (target_bits / duration) - 128000
 
         # Ensure minimum quality
-        video_bitrate = max(video_bitrate, 500000)  # Minimum 500kbps
+        video_bitrate = max(video_bitrate, 500_000)  # Minimum 500kbps
+
+        # Ensure maximum quality
+        video_bitrate = max(video_bitrate, 5_000_000)  # Maximum 5000kbps
 
         # Convert to kilobits
         video_bitrate_k = int(video_bitrate / 1000)
