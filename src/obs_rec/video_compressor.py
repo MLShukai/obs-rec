@@ -22,6 +22,54 @@ class VideoCompressor:
         """
         self.target_size_mb = target_size_mb
 
+    def convert_to_mp4(self, input_path: Path, output_path: Path | None = None) -> Path:
+        """Convert video to MP4 format.
+
+        Args:
+            input_path: Path to input video file.
+            output_path: Path for output MP4. If None, uses input.mp4.
+
+        Returns:
+            Path to converted MP4 file.
+
+        Raises:
+            RuntimeError: If conversion fails.
+        """
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+
+        if output_path is None:
+            output_path = input_path.with_suffix(".mp4")
+
+        # Skip if already MP4
+        if input_path.suffix.lower() == ".mp4" and output_path == input_path:
+            logger.info(f"File is already MP4: {input_path}")
+            return input_path
+
+        cmd = [
+            "ffmpeg",
+            "-i",
+            str(input_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(output_path),
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            logger.info(f"Converted to MP4: {input_path} -> {output_path}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"MP4 conversion failed: {e.stderr.decode()}")
+            raise RuntimeError(f"MP4 conversion failed: {e}")
+
     def compress(
         self,
         input_path: Path,
@@ -32,7 +80,7 @@ class VideoCompressor:
 
         Args:
             input_path: Path to input video file.
-            output_path: Path for compressed output. If None, uses input_compressed.ext.
+            output_path: Path for compressed output. If None, uses input_compressed.mp4.
             duration: Video duration in seconds. If None, will be detected.
 
         Returns:
@@ -45,7 +93,9 @@ class VideoCompressor:
             raise FileNotFoundError(f"Input file not found: {input_path}")
 
         if output_path is None:
-            output_path = input_path.with_stem(f"{input_path.stem}_compressed")
+            output_path = input_path.with_stem(
+                f"{input_path.stem}_compressed"
+            ).with_suffix(".mp4")
 
         # Get video duration if not provided
         if duration is None:
@@ -157,6 +207,8 @@ class VideoCompressor:
             "128k",  # Audio bitrate
             "-movflags",
             "+faststart",  # Web optimization
+            "-f",
+            "mp4",  # Force MP4 format
             "-y",  # Overwrite output
             str(output_path),
         ]
@@ -172,36 +224,52 @@ class VideoCompressor:
             raise RuntimeError(f"Video compression failed: {e}")
 
     def compress_if_needed(
-        self, video_path: Path, threshold_mb: float | None = None
+        self,
+        video_path: Path,
+        threshold_mb: float | None = None,
+        convert_to_mp4: bool = True,
     ) -> Path:
-        """Compress video only if it exceeds threshold size.
+        """Compress video only if it exceeds threshold size and optionally
+        convert to MP4.
 
         Args:
             video_path: Path to video file.
             threshold_mb: Size threshold in MB. Uses target_size_mb if None.
+            convert_to_mp4: Whether to convert to MP4 format.
 
         Returns:
-            Path to video (compressed or original).
+            Path to video (compressed/converted or original).
         """
         if threshold_mb is None:
             threshold_mb = self.target_size_mb
 
         file_size_mb = video_path.stat().st_size / (1024 * 1024)
+        needs_compression = file_size_mb > threshold_mb
+        needs_conversion = convert_to_mp4 and video_path.suffix.lower() != ".mp4"
 
-        if file_size_mb <= threshold_mb:
+        if not needs_compression and not needs_conversion:
             logger.info(
-                f"Video size ({file_size_mb:.2f} MB) within limit, skipping compression"
+                f"Video size ({file_size_mb:.2f} MB) within limit and already MP4, skipping processing"
             )
             return video_path
 
-        logger.info(f"Video size ({file_size_mb:.2f} MB) exceeds limit, compressing...")
-        compressed_path = self.compress(video_path)
+        if needs_compression:
+            logger.info(
+                f"Video size ({file_size_mb:.2f} MB) exceeds limit, compressing..."
+            )
+            processed_path = self.compress(video_path)
+        elif needs_conversion:
+            logger.info(f"Converting {video_path.suffix} to MP4...")
+            processed_path = self.convert_to_mp4(video_path)
+        else:
+            return video_path
 
-        # Delete original if compression successful
-        try:
-            video_path.unlink()
-            logger.info(f"Deleted original video: {video_path}")
-        except Exception as e:
-            logger.warning(f"Failed to delete original video: {e}")
+        # Delete original if processing successful
+        if processed_path != video_path:
+            try:
+                video_path.unlink()
+                logger.info(f"Deleted original video: {video_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete original video: {e}")
 
-        return compressed_path
+        return processed_path
