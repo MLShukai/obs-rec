@@ -16,6 +16,7 @@ services:
     working_dir: /workspace
     command: /bin/bash
     stop_grace_period: 0s
+    network_mode: host
 
 volumes:
   obs-rec:
