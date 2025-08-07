@@ -2,7 +2,7 @@
 
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 from pytest_mock import MockerFixture
@@ -18,38 +18,76 @@ class TestVideoCompressor:
         compressor = VideoCompressor(target_size_mb=50.0)
         assert compressor.target_size_mb == 50.0
 
-    def test_compress_success(self, mocker: MockerFixture, tmp_path: Path) -> None:
-        """Test successful video compression."""
-        # Create test files
-        input_path = tmp_path / "input.mp4"
-        input_path.write_bytes(b"fake video data")
-        output_path = tmp_path / "output.mp4"
+    def test_process_success(self, mocker: MockerFixture, tmp_path: Path) -> None:
+        """Test successful video processing."""
+        # Create test file
+        input_path = tmp_path / "input.mkv"
+        input_path.write_bytes(b"x" * (30 * 1024 * 1024))  # 30MB file
+
+        # Expected output path
+        output_path = tmp_path / "input_processed.mp4"
 
         # Mock subprocess and duration detection
-        mock_run = mocker.patch("subprocess.run")
-        mock_run.return_value.stdout = "30.0"  # Duration
-
-        compressor = VideoCompressor()
-
-        # Mock output file creation
-        def create_output(*args, **kwargs):
-            if "ffmpeg" in args[0][0]:
+        def mock_run(*args, **kwargs):
+            cmd = args[0]
+            if "ffprobe" in cmd[0]:
+                return MagicMock(stdout="30.0")
+            elif "ffmpeg" in cmd[0]:
+                # Create output file when ffmpeg runs
                 output_path.write_bytes(b"compressed")
-            return MagicMock(stdout="30.0")
+                return MagicMock()
+            return MagicMock()
 
-        mock_run.side_effect = create_output
+        mocker.patch("subprocess.run", side_effect=mock_run)
 
-        result = compressor.compress(input_path, output_path, duration=30.0)
+        compressor = VideoCompressor(target_size_mb=25.0)
+        result = compressor.process(input_path)
+
+        assert result == output_path
+        assert output_path.exists()
+        assert not input_path.exists()  # Original should be deleted
+
+    def test_process_already_optimal(
+        self, mocker: MockerFixture, tmp_path: Path
+    ) -> None:
+        """Test processing skipped for already optimal video."""
+        video_path = tmp_path / "video.mp4"
+        # Create 10MB MP4 file (under 25MB limit)
+        video_path.write_bytes(b"x" * (10 * 1024 * 1024))
+
+        compressor = VideoCompressor(target_size_mb=25.0)
+        result = compressor.process(video_path)
+
+        assert result == video_path  # Should return original
+
+    def test_process_convert_only(self, mocker: MockerFixture, tmp_path: Path) -> None:
+        """Test MP4 conversion without compression."""
+        input_path = tmp_path / "input.mkv"
+        input_path.write_bytes(b"x" * (10 * 1024 * 1024))  # 10MB file (under limit)
+
+        output_path = tmp_path / "input_processed.mp4"
+
+        def mock_run(*args, **kwargs):
+            cmd = args[0]
+            if "ffmpeg" in cmd[0]:
+                output_path.write_bytes(b"converted")
+                return MagicMock()
+            return MagicMock()
+
+        mocker.patch("subprocess.run", side_effect=mock_run)
+
+        compressor = VideoCompressor(target_size_mb=25.0)
+        result = compressor.process(input_path)
 
         assert result == output_path
         assert output_path.exists()
 
-    def test_compress_input_not_found(self) -> None:
-        """Test compression with non-existent input file."""
+    def test_process_input_not_found(self) -> None:
+        """Test processing with non-existent input file."""
         compressor = VideoCompressor()
 
         with pytest.raises(FileNotFoundError, match="Input file not found"):
-            compressor.compress(Path("/nonexistent/file.mp4"))
+            compressor.process(Path("/nonexistent/file.mp4"))
 
     def test_get_duration(self, mocker: MockerFixture, tmp_path: Path) -> None:
         """Test getting video duration."""
@@ -63,10 +101,33 @@ class TestVideoCompressor:
         duration = compressor._get_duration(video_path)
 
         assert duration == 42.5
-        mock_run.assert_called_once()
 
-    def test_get_duration_failure(self, mocker: MockerFixture, tmp_path: Path) -> None:
-        """Test duration detection failure fallback."""
+    def test_get_duration_fallback(self, mocker: MockerFixture, tmp_path: Path) -> None:
+        """Test duration detection with fallback."""
+        video_path = tmp_path / "video.mkv"
+        video_path.write_bytes(b"fake video")
+
+        call_count = 0
+
+        def mock_run(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call fails (format duration)
+                return MagicMock(stdout="N/A")
+            else:
+                # Second call succeeds (stream duration)
+                return MagicMock(stdout="45.0")
+
+        mocker.patch("subprocess.run", side_effect=mock_run)
+
+        compressor = VideoCompressor()
+        duration = compressor._get_duration(video_path)
+
+        assert duration == 45.0
+
+    def test_get_duration_default(self, mocker: MockerFixture, tmp_path: Path) -> None:
+        """Test duration detection failure uses default."""
         video_path = tmp_path / "video.mp4"
         video_path.write_bytes(b"fake video")
 
@@ -80,113 +141,107 @@ class TestVideoCompressor:
 
         assert duration == 30.0  # Default fallback
 
-    def test_calculate_bitrate(self) -> None:
-        """Test bitrate calculation."""
-        compressor = VideoCompressor(target_size_mb=25.0)
-
-        # 30 second video
-        bitrate = compressor._calculate_bitrate(30.0)
-        bitrate_k = int(bitrate[:-1])
-
-        # Should be around 6500k for 25MB/30s minus audio
-        assert bitrate_k > 5000
-        assert bitrate_k < 8000
-
-    def test_run_ffmpeg_success(self, mocker: MockerFixture, tmp_path: Path) -> None:
-        """Test successful ffmpeg execution."""
+    def test_build_compress_cmd(self, mocker: MockerFixture, tmp_path: Path) -> None:
+        """Test compress command building."""
         input_path = tmp_path / "input.mp4"
         output_path = tmp_path / "output.mp4"
 
-        mock_run = mocker.patch("subprocess.run")
-
-        compressor = VideoCompressor()
-        compressor._run_ffmpeg(input_path, output_path, "1000k")
-
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        assert "ffmpeg" in args[0]
-        assert str(input_path) in args
-        assert str(output_path) in args
-        assert "1000k" in args
-
-    def test_run_ffmpeg_failure(self, mocker: MockerFixture, tmp_path: Path) -> None:
-        """Test ffmpeg execution failure."""
-        input_path = tmp_path / "input.mp4"
-        output_path = tmp_path / "output.mp4"
-
-        mocker.patch(
-            "subprocess.run",
-            side_effect=subprocess.CalledProcessError(
-                1, "ffmpeg", stderr=b"Error message"
-            ),
-        )
-
-        compressor = VideoCompressor()
-
-        with pytest.raises(RuntimeError, match="Video compression failed"):
-            compressor._run_ffmpeg(input_path, output_path, "1000k")
-
-    def test_compress_if_needed_under_limit(
-        self, mocker: MockerFixture, tmp_path: Path
-    ) -> None:
-        """Test compression skipped when file is under limit."""
-        video_path = tmp_path / "video.mp4"
-        # Create 10MB file (under 25MB limit)
-        video_path.write_bytes(b"x" * (10 * 1024 * 1024))
+        mocker.patch.object(VideoCompressor, "_get_duration", return_value=30.0)
 
         compressor = VideoCompressor(target_size_mb=25.0)
-        result = compressor.compress_if_needed(video_path)
+        cmd = compressor._build_compress_cmd(input_path, output_path)
 
-        assert result == video_path  # Should return original
+        assert "ffmpeg" in cmd[0]
+        assert str(input_path) in cmd
+        assert str(output_path) in cmd
+        assert "-c:v" in cmd
+        assert "libx264" in cmd
+        assert "-b:v" in cmd
 
-    def test_compress_if_needed_over_limit(
+    def test_build_convert_cmd(self, tmp_path: Path) -> None:
+        """Test convert command building."""
+        input_path = tmp_path / "input.mkv"
+        output_path = tmp_path / "output.mp4"
+
+        compressor = VideoCompressor()
+        cmd = compressor._build_convert_cmd(input_path, output_path)
+
+        assert "ffmpeg" in cmd[0]
+        assert str(input_path) in cmd
+        assert str(output_path) in cmd
+        assert "-c:v" in cmd
+        assert "libx264" in cmd
+        assert "-preset" in cmd
+        assert "fast" in cmd
+
+    def test_process_ffmpeg_failure(
         self, mocker: MockerFixture, tmp_path: Path
     ) -> None:
-        """Test compression triggered when file exceeds limit."""
-        video_path = tmp_path / "video.mp4"
-        # Create 30MB file (over 25MB limit)
+        """Test handling of ffmpeg failure."""
+        input_path = tmp_path / "input.mkv"
+        input_path.write_bytes(b"x" * (30 * 1024 * 1024))
+
+        def mock_run(*args, **kwargs):
+            cmd = args[0]
+            if "ffprobe" in cmd[0]:
+                return MagicMock(stdout="30.0")
+            elif "ffmpeg" in cmd[0]:
+                raise subprocess.CalledProcessError(1, "ffmpeg", stderr=b"Error")
+            return MagicMock()
+
+        mocker.patch("subprocess.run", side_effect=mock_run)
+
+        compressor = VideoCompressor()
+
+        with pytest.raises(RuntimeError, match="Video processing failed"):
+            compressor.process(input_path)
+
+    def test_compress_if_needed_backward_compat(
+        self, mocker: MockerFixture, tmp_path: Path
+    ) -> None:
+        """Test compress_if_needed backward compatibility."""
+        video_path = tmp_path / "video.mkv"
         video_path.write_bytes(b"x" * (30 * 1024 * 1024))
 
-        compressed_path = tmp_path / "video_compressed.mp4"
+        processed_path = tmp_path / "video_processed.mp4"
 
-        # Mock compress method
-        mock_compress = mocker.patch.object(
+        # Mock process method
+        mock_process = mocker.patch.object(
             VideoCompressor,
-            "compress",
-            return_value=compressed_path,
+            "process",
+            return_value=processed_path,
         )
 
-        # Create compressed file
-        compressed_path.write_bytes(b"compressed")
+        compressor = VideoCompressor()
+        result = compressor.compress_if_needed(video_path, threshold_mb=20.0)
 
-        compressor = VideoCompressor(target_size_mb=25.0)
-        result = compressor.compress_if_needed(video_path)
+        assert result == processed_path
+        assert compressor.target_size_mb == 20.0
+        mock_process.assert_called_once_with(video_path)
 
-        assert result == compressed_path
-        mock_compress.assert_called_once_with(video_path)
-        assert not video_path.exists()  # Original should be deleted
-
-    def test_compress_if_needed_deletion_failure(
+    def test_process_deletion_failure(
         self, mocker: MockerFixture, tmp_path: Path
     ) -> None:
         """Test handling of original file deletion failure."""
-        video_path = tmp_path / "video.mp4"
-        video_path.write_bytes(b"x" * (30 * 1024 * 1024))
+        input_path = tmp_path / "input.mkv"
+        input_path.write_bytes(b"x" * (30 * 1024 * 1024))
 
-        compressed_path = tmp_path / "video_compressed.mp4"
-        compressed_path.write_bytes(b"compressed")
+        output_path = tmp_path / "input_processed.mp4"
 
-        mocker.patch.object(
-            VideoCompressor,
-            "compress",
-            return_value=compressed_path,
-        )
+        def mock_run(*args, **kwargs):
+            cmd = args[0]
+            if "ffprobe" in cmd[0]:
+                return MagicMock(stdout="30.0")
+            elif "ffmpeg" in cmd[0]:
+                output_path.write_bytes(b"compressed")
+                return MagicMock()
+            return MagicMock()
 
-        # Mock unlink to raise exception
+        mocker.patch("subprocess.run", side_effect=mock_run)
         mocker.patch.object(Path, "unlink", side_effect=OSError("Permission denied"))
 
         compressor = VideoCompressor(target_size_mb=25.0)
-        result = compressor.compress_if_needed(video_path)
+        result = compressor.process(input_path)
 
-        assert result == compressed_path
-        assert video_path.exists()  # Original still exists due to deletion failure
+        assert result == output_path
+        assert input_path.exists()  # Original still exists due to deletion failure
