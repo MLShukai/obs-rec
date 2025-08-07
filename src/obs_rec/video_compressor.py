@@ -147,7 +147,35 @@ class VideoCompressor:
                 text=True,
                 check=True,
             )
-            return float(result.stdout.strip())
+            duration_str = result.stdout.strip()
+            if duration_str and duration_str != "N/A":
+                return float(duration_str)
+            else:
+                # Try alternative method for MKV files
+                logger.warning(
+                    "Duration not found with format=duration, trying streams"
+                )
+                cmd_alt = [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(video_path),
+                ]
+                result_alt = subprocess.run(
+                    cmd_alt, capture_output=True, text=True, check=True
+                )
+                duration_str_alt = result_alt.stdout.strip()
+                if duration_str_alt and duration_str_alt != "N/A":
+                    return float(duration_str_alt)
+                # Default to 30 seconds if detection fails
+                logger.warning("Could not detect duration, using default 30 seconds")
+                return 30.0
         except (subprocess.CalledProcessError, ValueError) as e:
             logger.error(f"Failed to get video duration: {e}")
             # Default to 30 seconds if detection fails
@@ -171,8 +199,8 @@ class VideoCompressor:
         # Ensure minimum quality
         video_bitrate = max(video_bitrate, 500_000)  # Minimum 500kbps
 
-        # Ensure maximum quality
-        video_bitrate = max(video_bitrate, 5_000_000)  # Maximum 5000kbps
+        # Ensure maximum quality (should be min, not max)
+        video_bitrate = min(video_bitrate, 5_000_000)  # Maximum 5000kbps
 
         # Convert to kilobits
         video_bitrate_k = int(video_bitrate / 1000)
